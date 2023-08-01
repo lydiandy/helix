@@ -32,7 +32,6 @@ use helix_core::{
     RopeReader, RopeSlice, Selection, SmallVec, Tendril, Transaction,
 };
 use helix_view::{
-    clipboard::ClipboardType,
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
     editor::{Action, CompleteAction},
     info::Info,
@@ -376,6 +375,8 @@ impl MappableCommand {
         later, "Move forward in history",
         commit_undo_checkpoint, "Commit changes to new checkpoint",
         yank, "Yank selection",
+        yank_to_clipboard, "Yank selections to clipboard",
+        yank_to_primary_clipboard, "Yank selections to primary clipboard",
         yank_joined, "Join and yank selections",
         yank_joined_to_clipboard, "Join and yank selections to clipboard",
         yank_main_selection_to_clipboard, "Yank main selection to clipboard",
@@ -1847,11 +1848,11 @@ fn search_impl(
 
 fn search_completions(cx: &mut Context, reg: Option<char>) -> Vec<String> {
     let mut items = reg
-        .and_then(|reg| cx.editor.registers.get(reg))
-        .map_or(Vec::new(), |reg| reg.read().iter().take(200).collect());
+        .and_then(|reg| cx.editor.registers.read(reg, cx.editor))
+        .map_or(Vec::new(), |reg| reg.take(200).collect());
     items.sort_unstable();
     items.dedup();
-    items.into_iter().cloned().collect()
+    items.into_iter().map(|value| value.to_string()).collect()
 }
 
 fn search(cx: &mut Context) {
@@ -1908,11 +1909,11 @@ fn searcher(cx: &mut Context, direction: Direction) {
 
 fn search_next_or_prev_impl(cx: &mut Context, movement: Movement, direction: Direction) {
     let count = cx.count();
+    let register = cx.register.unwrap_or('/');
     let config = cx.editor.config();
     let scrolloff = config.scrolloff;
-    let (_, doc) = current!(cx.editor);
-    let registers = &cx.editor.registers;
-    if let Some(query) = registers.read('/').and_then(|query| query.last()) {
+    if let Some(query) = cx.editor.registers.first(register, cx.editor) {
+        let doc = doc!(cx.editor);
         let contents = doc.text().slice(..).to_string();
         let search_config = &config.search;
         let case_insensitive = if search_config.smart_case {
@@ -1921,7 +1922,7 @@ fn search_next_or_prev_impl(cx: &mut Context, movement: Movement, direction: Dir
             false
         };
         let wrap_around = search_config.wrap_around;
-        if let Ok(regex) = RegexBuilder::new(query)
+        if let Ok(regex) = RegexBuilder::new(&query)
             .case_insensitive(case_insensitive)
             .multi_line(true)
             .build()
@@ -1961,6 +1962,7 @@ fn extend_search_prev(cx: &mut Context) {
 }
 
 fn search_selection(cx: &mut Context) {
+    let register = cx.register.unwrap_or('/');
     let (view, doc) = current!(cx.editor);
     let contents = doc.text().slice(..);
 
@@ -1973,13 +1975,16 @@ fn search_selection(cx: &mut Context) {
         .collect::<Vec<_>>()
         .join("|");
 
-    let msg = format!("register '{}' set to '{}'", '/', &regex);
-    cx.editor.registers.push('/', regex);
-    cx.editor.set_status(msg);
+    let msg = format!("register '{}' set to '{}'", register, &regex);
+    match cx.editor.registers.push(register, regex) {
+        Ok(_) => cx.editor.set_status(msg),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 }
 
 fn make_search_word_bounded(cx: &mut Context) {
-    let regex = match cx.editor.registers.last('/') {
+    let register = cx.register.unwrap_or('/');
+    let regex = match cx.editor.registers.first(register, cx.editor) {
         Some(regex) => regex,
         None => return,
     };
@@ -1997,14 +2002,16 @@ fn make_search_word_bounded(cx: &mut Context) {
     if !start_anchored {
         new_regex.push_str("\\b");
     }
-    new_regex.push_str(regex);
+    new_regex.push_str(&regex);
     if !end_anchored {
         new_regex.push_str("\\b");
     }
 
-    let msg = format!("register '{}' set to '{}'", '/', &new_regex);
-    cx.editor.registers.push('/', new_regex);
-    cx.editor.set_status(msg);
+    let msg = format!("register '{}' set to '{}'", register, &new_regex);
+    match cx.editor.registers.push(register, new_regex) {
+        Ok(_) => cx.editor.set_status(msg),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 }
 
 fn global_search(cx: &mut Context) {
@@ -2367,7 +2374,10 @@ fn delete_selection_impl(cx: &mut Context, op: Operation) {
         let text = doc.text().slice(..);
         let values: Vec<String> = selection.fragments(text).map(Cow::into_owned).collect();
         let reg_name = cx.register.unwrap_or('"');
-        cx.editor.registers.write(reg_name, values);
+        if let Err(err) = cx.editor.registers.write(reg_name, values) {
+            cx.editor.set_error(err.to_string());
+            return;
+        }
     };
 
     // then delete
@@ -3750,7 +3760,22 @@ fn commit_undo_checkpoint(cx: &mut Context) {
 // Yank / Paste
 
 fn yank(cx: &mut Context) {
-    let (view, doc) = current!(cx.editor);
+    yank_impl(cx.editor, cx.register.unwrap_or('"'));
+    exit_select_mode(cx);
+}
+
+fn yank_to_clipboard(cx: &mut Context) {
+    yank_impl(cx.editor, '*');
+    exit_select_mode(cx);
+}
+
+fn yank_to_primary_clipboard(cx: &mut Context) {
+    yank_impl(cx.editor, '+');
+    exit_select_mode(cx);
+}
+
+fn yank_impl(editor: &mut Editor, register: char) {
+    let (view, doc) = current!(editor);
     let text = doc.text().slice(..);
 
     let values: Vec<String> = doc
@@ -3758,19 +3783,15 @@ fn yank(cx: &mut Context) {
         .fragments(text)
         .map(Cow::into_owned)
         .collect();
+    let selections = values.len();
 
-    let msg = format!(
-        "yanked {} selection(s) to register {}",
-        values.len(),
-        cx.register.unwrap_or('"')
-    );
-
-    cx.editor
-        .registers
-        .write(cx.register.unwrap_or('"'), values);
-
-    cx.editor.set_status(msg);
-    exit_select_mode(cx);
+    match editor.registers.write(register, values) {
+        Ok(_) => editor.set_status(format!(
+            "yanked {selections} selection{} to register {register}",
+            if selections == 1 { "" } else { "s" }
+        )),
+        Err(err) => editor.set_error(err.to_string()),
+    }
 }
 
 fn yank_joined_impl(editor: &mut Editor, separator: &str, register: char) {
@@ -3778,6 +3799,7 @@ fn yank_joined_impl(editor: &mut Editor, separator: &str, register: char) {
     let text = doc.text().slice(..);
 
     let selection = doc.selection(view.id);
+    let selections = selection.len();
     let joined = selection
         .fragments(text)
         .fold(String::new(), |mut acc, fragment| {
@@ -3788,104 +3810,52 @@ fn yank_joined_impl(editor: &mut Editor, separator: &str, register: char) {
             acc
         });
 
-    let msg = format!(
-        "joined and yanked {} selection(s) to register {}",
-        selection.len(),
-        register,
-    );
-
-    editor.registers.write(register, vec![joined]);
-    editor.set_status(msg);
+    match editor.registers.write(register, vec![joined]) {
+        Ok(_) => editor.set_status(format!(
+            "joined and yanked {selections} selection{} to register {register}",
+            if selections == 1 { "" } else { "s" }
+        )),
+        Err(err) => editor.set_error(err.to_string()),
+    }
 }
 
 fn yank_joined(cx: &mut Context) {
-    let line_ending = doc!(cx.editor).line_ending;
-    let register = cx.register.unwrap_or('"');
-    yank_joined_impl(cx.editor, line_ending.as_str(), register);
+    let separator = doc!(cx.editor).line_ending.as_str();
+    yank_joined_impl(cx.editor, separator, cx.register.unwrap_or('"'));
     exit_select_mode(cx);
-}
-
-fn yank_joined_to_clipboard_impl(
-    editor: &mut Editor,
-    separator: &str,
-    clipboard_type: ClipboardType,
-) -> anyhow::Result<()> {
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
-
-    let values: Vec<String> = doc
-        .selection(view.id)
-        .fragments(text)
-        .map(Cow::into_owned)
-        .collect();
-
-    let clipboard_text = match clipboard_type {
-        ClipboardType::Clipboard => "system clipboard",
-        ClipboardType::Selection => "primary clipboard",
-    };
-
-    let msg = format!(
-        "joined and yanked {} selection(s) to {}",
-        values.len(),
-        clipboard_text,
-    );
-
-    let joined = values.join(separator);
-
-    editor
-        .clipboard_provider
-        .set_contents(joined, clipboard_type)
-        .context("Couldn't set system clipboard content")?;
-
-    editor.set_status(msg);
-
-    Ok(())
 }
 
 fn yank_joined_to_clipboard(cx: &mut Context) {
     let line_ending = doc!(cx.editor).line_ending;
-    let _ =
-        yank_joined_to_clipboard_impl(cx.editor, line_ending.as_str(), ClipboardType::Clipboard);
+    yank_joined_impl(cx.editor, line_ending.as_str(), '*');
     exit_select_mode(cx);
-}
-
-fn yank_main_selection_to_clipboard_impl(
-    editor: &mut Editor,
-    clipboard_type: ClipboardType,
-) -> anyhow::Result<()> {
-    let (view, doc) = current!(editor);
-    let text = doc.text().slice(..);
-
-    let message_text = match clipboard_type {
-        ClipboardType::Clipboard => "yanked main selection to system clipboard",
-        ClipboardType::Selection => "yanked main selection to primary clipboard",
-    };
-
-    let value = doc.selection(view.id).primary().fragment(text);
-
-    if let Err(e) = editor
-        .clipboard_provider
-        .set_contents(value.into_owned(), clipboard_type)
-    {
-        bail!("Couldn't set system clipboard content: {}", e);
-    }
-
-    editor.set_status(message_text);
-    Ok(())
-}
-
-fn yank_main_selection_to_clipboard(cx: &mut Context) {
-    let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Clipboard);
 }
 
 fn yank_joined_to_primary_clipboard(cx: &mut Context) {
     let line_ending = doc!(cx.editor).line_ending;
-    let _ =
-        yank_joined_to_clipboard_impl(cx.editor, line_ending.as_str(), ClipboardType::Selection);
+    yank_joined_impl(cx.editor, line_ending.as_str(), '+');
+    exit_select_mode(cx);
+}
+
+fn yank_primary_selection_impl(editor: &mut Editor, register: char) {
+    let (view, doc) = current!(editor);
+    let text = doc.text().slice(..);
+
+    let selection = doc.selection(view.id).primary().fragment(text).to_string();
+
+    match editor.registers.write(register, vec![selection]) {
+        Ok(_) => editor.set_status(format!("yanked primary selection to register {register}",)),
+        Err(err) => editor.set_error(err.to_string()),
+    }
+}
+
+fn yank_main_selection_to_clipboard(cx: &mut Context) {
+    yank_primary_selection_impl(cx.editor, '*');
+    exit_select_mode(cx);
 }
 
 fn yank_main_selection_to_primary_clipboard(cx: &mut Context) {
-    let _ = yank_main_selection_to_clipboard_impl(cx.editor, ClipboardType::Selection);
+    yank_primary_selection_impl(cx.editor, '+');
     exit_select_mode(cx);
 }
 
@@ -3985,144 +3955,88 @@ pub(crate) fn paste_bracketed_value(cx: &mut Context, contents: String) {
     paste_impl(&[contents], doc, view, paste, count, cx.editor.mode);
 }
 
-fn paste_clipboard_impl(
-    editor: &mut Editor,
-    action: Paste,
-    clipboard_type: ClipboardType,
-    count: usize,
-) -> anyhow::Result<()> {
-    let (view, doc) = current!(editor);
-    match editor.clipboard_provider.get_contents(clipboard_type) {
-        Ok(contents) => {
-            paste_impl(&[contents], doc, view, action, count, editor.mode);
-            Ok(())
-        }
-        Err(e) => Err(e.context("Couldn't get system clipboard contents")),
-    }
-}
-
 fn paste_clipboard_after(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::After,
-        ClipboardType::Clipboard,
-        cx.count(),
-    );
+    paste(cx.editor, '*', Paste::After, cx.count());
 }
 
 fn paste_clipboard_before(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::Before,
-        ClipboardType::Clipboard,
-        cx.count(),
-    );
+    paste(cx.editor, '*', Paste::Before, cx.count());
 }
 
 fn paste_primary_clipboard_after(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
-        cx.editor,
-        Paste::After,
-        ClipboardType::Selection,
-        cx.count(),
-    );
+    paste(cx.editor, '+', Paste::After, cx.count());
 }
 
 fn paste_primary_clipboard_before(cx: &mut Context) {
-    let _ = paste_clipboard_impl(
+    paste(cx.editor, '+', Paste::Before, cx.count());
+}
+
+fn replace_with_yanked(cx: &mut Context) {
+    replace_with_yanked_impl(cx.editor, cx.register.unwrap_or('"'), cx.count());
+    exit_select_mode(cx);
+}
+
+fn replace_with_yanked_impl(editor: &mut Editor, register: char, count: usize) {
+    let Some(values) = editor.registers
+        .read(register, editor)
+        .filter(|values| values.len() > 0) else { return };
+    let values: Vec<_> = values.map(|value| value.to_string()).collect();
+
+    let (view, doc) = current!(editor);
+    let repeat = std::iter::repeat(
+        values
+            .last()
+            .map(|value| Tendril::from(&value.repeat(count)))
+            .unwrap(),
+    );
+    let mut values = values
+        .iter()
+        .map(|value| Tendril::from(&value.repeat(count)))
+        .chain(repeat);
+    let selection = doc.selection(view.id);
+    let transaction = Transaction::change_by_selection(doc.text(), selection, |range| {
+        if !range.is_empty() {
+            (range.from(), range.to(), Some(values.next().unwrap()))
+        } else {
+            (range.from(), range.to(), None)
+        }
+    });
+
+    doc.apply(&transaction, view.id);
+}
+
+fn replace_selections_with_clipboard(cx: &mut Context) {
+    replace_with_yanked_impl(cx.editor, '*', cx.count());
+}
+
+fn replace_selections_with_primary_clipboard(cx: &mut Context) {
+    replace_with_yanked_impl(cx.editor, '+', cx.count());
+}
+
+fn paste(editor: &mut Editor, register: char, pos: Paste, count: usize) {
+    let Some(values) = editor.registers.read(register, editor) else { return };
+    let values: Vec<_> = values.map(|value| value.to_string()).collect();
+
+    let (view, doc) = current!(editor);
+    paste_impl(&values, doc, view, pos, count, editor.mode);
+}
+
+fn paste_after(cx: &mut Context) {
+    paste(
         cx.editor,
-        Paste::Before,
-        ClipboardType::Selection,
+        cx.register.unwrap_or('"'),
+        Paste::After,
         cx.count(),
     );
 }
 
-fn replace_with_yanked(cx: &mut Context) {
-    let count = cx.count();
-    let reg_name = cx.register.unwrap_or('"');
-    let (view, doc) = current!(cx.editor);
-    let registers = &mut cx.editor.registers;
-
-    if let Some(values) = registers.read(reg_name) {
-        if !values.is_empty() {
-            let repeat = std::iter::repeat(
-                values
-                    .last()
-                    .map(|value| Tendril::from(&value.repeat(count)))
-                    .unwrap(),
-            );
-            let mut values = values
-                .iter()
-                .map(|value| Tendril::from(&value.repeat(count)))
-                .chain(repeat);
-            let selection = doc.selection(view.id);
-            let transaction = Transaction::change_by_selection(doc.text(), selection, |range| {
-                if !range.is_empty() {
-                    (range.from(), range.to(), Some(values.next().unwrap()))
-                } else {
-                    (range.from(), range.to(), None)
-                }
-            });
-
-            doc.apply(&transaction, view.id);
-            exit_select_mode(cx);
-        }
-    }
-}
-
-fn replace_selections_with_clipboard_impl(
-    cx: &mut Context,
-    clipboard_type: ClipboardType,
-) -> anyhow::Result<()> {
-    let count = cx.count();
-    let (view, doc) = current!(cx.editor);
-
-    match cx.editor.clipboard_provider.get_contents(clipboard_type) {
-        Ok(contents) => {
-            let selection = doc.selection(view.id);
-            let transaction = Transaction::change_by_selection(doc.text(), selection, |range| {
-                (
-                    range.from(),
-                    range.to(),
-                    Some(contents.repeat(count).as_str().into()),
-                )
-            });
-
-            doc.apply(&transaction, view.id);
-            doc.append_changes_to_history(view);
-        }
-        Err(e) => return Err(e.context("Couldn't get system clipboard contents")),
-    }
-
-    exit_select_mode(cx);
-    Ok(())
-}
-
-fn replace_selections_with_clipboard(cx: &mut Context) {
-    let _ = replace_selections_with_clipboard_impl(cx, ClipboardType::Clipboard);
-}
-
-fn replace_selections_with_primary_clipboard(cx: &mut Context) {
-    let _ = replace_selections_with_clipboard_impl(cx, ClipboardType::Selection);
-}
-
-fn paste(cx: &mut Context, pos: Paste) {
-    let count = cx.count();
-    let reg_name = cx.register.unwrap_or('"');
-    let (view, doc) = current!(cx.editor);
-    let registers = &mut cx.editor.registers;
-
-    if let Some(values) = registers.read(reg_name) {
-        paste_impl(values, doc, view, pos, count, cx.editor.mode);
-    }
-}
-
-fn paste_after(cx: &mut Context) {
-    paste(cx, Paste::After)
-}
-
 fn paste_before(cx: &mut Context) {
-    paste(cx, Paste::Before)
+    paste(
+        cx.editor,
+        cx.register.unwrap_or('"'),
+        Paste::Before,
+        cx.count(),
+    );
 }
 
 fn get_lines(doc: &Document, view_id: ViewId) -> Vec<usize> {
@@ -4879,7 +4793,12 @@ fn insert_register(cx: &mut Context) {
         if let Some(ch) = event.char() {
             cx.editor.autoinfo = None;
             cx.register = Some(ch);
-            paste(cx, Paste::Cursor);
+            paste(
+                cx.editor,
+                cx.register.unwrap_or('"'),
+                Paste::Cursor,
+                cx.count(),
+            );
         }
     })
 }
@@ -5593,9 +5512,12 @@ fn record_macro(cx: &mut Context) {
                 }
             })
             .collect::<String>();
-        cx.editor.registers.write(reg, vec![s]);
-        cx.editor
-            .set_status(format!("Recorded to register [{}]", reg));
+        match cx.editor.registers.write(reg, vec![s]) {
+            Ok(_) => cx
+                .editor
+                .set_status(format!("Recorded to register [{}]", reg)),
+            Err(err) => cx.editor.set_error(err.to_string()),
+        }
     } else {
         let reg = cx.register.take().unwrap_or('@');
         cx.editor.macro_recording = Some((reg, Vec::new()));
@@ -5615,8 +5537,14 @@ fn replay_macro(cx: &mut Context) {
         return;
     }
 
-    let keys: Vec<KeyEvent> = if let Some([keys_str]) = cx.editor.registers.read(reg) {
-        match helix_view::input::parse_macro(keys_str) {
+    let keys: Vec<KeyEvent> = if let Some(keys) = cx
+        .editor
+        .registers
+        .read(reg, cx.editor)
+        .filter(|values| values.len() == 1)
+        .map(|mut values| values.next().unwrap())
+    {
+        match helix_view::input::parse_macro(&keys) {
             Ok(keys) => keys,
             Err(err) => {
                 cx.editor.set_error(format!("Invalid macro: {}", err));
